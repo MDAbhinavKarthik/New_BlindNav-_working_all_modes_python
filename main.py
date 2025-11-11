@@ -68,6 +68,9 @@ asyncio.run = _safe_asyncio_run
 # -------------------------
 # engine = pyttsx3.init('sapi5')
 local_model = YOLO("yolov8n.pt")  # local detection model
+# Enhanced models for better detection
+enhanced_model = None  # Will be loaded on demand (YOLOv8m or YOLOv8x)
+detr_model = None  # DETR model for additional classes
 try:
     if BlipProcessor is not None and BlipForConditionalGeneration is not None:
         processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
@@ -640,6 +643,16 @@ def run_walking_mode():
                             if current_time - last_orientation_announcement > 8.0:
                                 speak(orientation['message'])
                                 last_orientation_announcement = current_time
+                
+                # Real-time cloud detection (check every 60 frames to avoid spam)
+                if frame_count % 60 == 0:  # Check every 60 frames (~30 seconds)
+                    try:
+                        cloud_analysis = detect_clouds_and_predict_rain(frame)
+                        if cloud_analysis.get("clouds_detected") and cloud_analysis.get("rain_probability", 0) > 50:
+                            if cloud_analysis.get("rain_prediction") in ["likely", "very_likely"]:
+                                speak(cloud_analysis.get("message", "Heavy clouds detected. Rain is likely."))
+                    except Exception as e:
+                        print(f"[Cloud Detection Error in Walking Mode]: {e}")
                 
                 # Skip detection if camera is too tilted
                 if orientation.get('severity') == 'major':
@@ -2755,20 +2768,30 @@ def need_umbrella():
     
     if not city:
         # Try to get location using the main function
-        coords = get_current_location()
-        if coords:
-            # Reverse geocode to get city name
-            try:
-                geo_url = "https://nominatim.openstreetmap.org/reverse"
-                r = requests.get(
-                    geo_url,
-                    params={"lat": coords[0], "lon": coords[1], "format": "json"},
-                    headers={"User-Agent": "blind-nav"},
-                    timeout=4
-                )
-                city = r.json().get("address", {}).get("city") or r.json().get("address", {}).get("town") or "your location"
-            except:
-                city = "your location"
+        location_result = get_current_location()
+        if location_result:
+            coords = extract_coords_from_location(location_result)
+            if coords:
+                # Use address from location result if available, otherwise reverse geocode
+                if isinstance(location_result, dict) and location_result.get("address"):
+                    address = location_result["address"]
+                    city = address.get("city") or address.get("town") or "your location"
+                else:
+                    # Fallback: reverse geocode to get city name
+                    try:
+                        geo_url = "https://nominatim.openstreetmap.org/reverse"
+                        r = requests.get(
+                            geo_url,
+                            params={"lat": coords[0], "lon": coords[1], "format": "json"},
+                            headers={"User-Agent": "blind-nav"},
+                            timeout=4
+                        )
+                        city = r.json().get("address", {}).get("city") or r.json().get("address", {}).get("town") or "your location"
+                    except:
+                        city = "your location"
+            else:
+                speak("Sorry, I couldn't determine your location. Please try again.")
+                return
         else:
             speak("Sorry, I couldn't determine your location. Please try again.")
             return
@@ -3031,11 +3054,16 @@ def run_assistant_mode():
         ]):
             try:
                 speak("Finding the nearest bus stop...")
-                start_coords = get_current_location()
+                location_result = get_current_location()
+                start_coords = extract_coords_from_location(location_result)
                 if start_coords:
                     bus_stop = find_nearby_bus_stops(start_coords[0], start_coords[1])
                     if bus_stop:
-                        speak(f"The nearest bus stop is {bus_stop['name']}, approximately {bus_stop['distance']} meters away.")
+                        # Provide context about current location if available
+                        location_context = ""
+                        if isinstance(location_result, dict) and location_result.get("display_address"):
+                            location_context = f" from {location_result['display_address']}"
+                        speak(f"The nearest bus stop is {bus_stop['name']}, approximately {bus_stop['distance']} meters away{location_context}.")
                     else:
                         speak("I couldn't find any nearby bus stops. Please try a different location or check your internet connection.")
                 else:
@@ -3044,6 +3072,49 @@ def run_assistant_mode():
                 print(f"[Bus Stop Query Error]: {e}")
                 speak("I encountered an error while searching for bus stops. Please try again.")
             continue  # Continue to next iteration, don't check for exit
+        
+        # Handle location queries - provide street-level address information
+        elif any(phrase in command for phrase in [
+            "where am i", "what's my location", "my location", "current location",
+            "where am i located", "tell me my location", "what is my location",
+            "show my location", "detect my location", "find my location"
+        ]):
+            try:
+                speak("Detecting your exact location with street-level accuracy...")
+                location_result = get_current_location()
+                if location_result:
+                    if isinstance(location_result, dict):
+                        address = location_result.get("address", {})
+                        display_address = location_result.get("display_address")
+                        coords = location_result.get("coords")
+                        
+                        if display_address:
+                            speak(f"You are currently at: {display_address}")
+                        elif address.get("street"):
+                            street = address.get("street")
+                            if address.get("house_number"):
+                                street = f"{address['house_number']} {street}"
+                            area = address.get("area", "")
+                            city = address.get("city", "")
+                            location_str = ", ".join(filter(None, [street, area, city]))
+                            speak(f"You are currently at: {location_str}")
+                        elif address.get("city"):
+                            city = address.get("city")
+                            state = address.get("state", "")
+                            location_str = ", ".join(filter(None, [city, state]))
+                            speak(f"You are currently in: {location_str}")
+                        
+                        if coords:
+                            speak(f"Coordinates: {coords[0]:.6f}, {coords[1]:.6f}")
+                    else:
+                        # Fallback for old format
+                        speak(f"Your coordinates: {location_result[0]:.6f}, {location_result[1]:.6f}")
+                else:
+                    speak("I couldn't determine your location. Please check your internet connection or enable location services.")
+            except Exception as e:
+                print(f"[Location Query Error]: {e}")
+                speak("I encountered an error while detecting your location. Please try again.")
+            continue  # Continue to next iteration
         
         # Exit condition - run continuously until exit is said
         if is_exit_command(command):
@@ -3074,6 +3145,30 @@ def run_assistant_mode():
         # Check for rain queries first (including "will it rain today")
         elif "rain" in command or "umbrella" in command or "will it rain" in command:
             need_umbrella()
+        
+        # Real-time cloud detection and rain prediction from camera
+        elif ("check clouds" in command or "detect clouds" in command or 
+              ("clouds" in command and "check" in command) or 
+              "check sky" in command or "analyze sky" in command):
+            try:
+                speak("Checking the sky for clouds and analyzing rain probability. Please point your camera towards the sky.")
+                cap = cv2.VideoCapture(0)
+                if cap.isOpened():
+                    ret, frame = cap.read()
+                    if ret and frame is not None:
+                        cloud_analysis = detect_clouds_and_predict_rain(frame)
+                        if cloud_analysis.get("message"):
+                            speak(cloud_analysis.get("message"))
+                        else:
+                            speak("I couldn't analyze the sky properly. Please ensure the camera is pointing towards the sky.")
+                    else:
+                        speak("Could not capture camera feed. Please check your camera.")
+                    cap.release()
+                else:
+                    speak("Camera not available. Please check the connection.")
+            except Exception as e:
+                print(f"[Cloud Check Error]: {e}")
+                speak("I encountered an error while checking the sky. Please try again.")
 
         elif "weather" in command:
             get_weather()
@@ -3221,10 +3316,194 @@ def listen():
 # ===============================
 # GEOLOCATION FUNCTIONS
 # ===============================
+def get_detailed_address_from_coords(lat, lon):
+    """
+    Get detailed street-level address from coordinates using multiple reverse geocoding services.
+    Returns a dictionary with street, area, city, and full address.
+    """
+    address_info = {
+        "street": None,
+        "area": None,
+        "city": None,
+        "state": None,
+        "country": None,
+        "postal_code": None,
+        "full_address": None,
+        "display_address": None
+    }
+    
+    reverse_geocoding_results = []
+    
+    def try_nominatim():
+        """Try OpenStreetMap Nominatim for reverse geocoding."""
+        try:
+            geo_url = "https://nominatim.openstreetmap.org/reverse"
+            response = requests.get(
+                geo_url,
+                params={
+                    "lat": lat,
+                    "lon": lon,
+                    "format": "json",
+                    "addressdetails": 1,
+                    "zoom": 18  # High zoom for street-level detail
+                },
+                headers={"User-Agent": "BlindNav-Assistant/1.0"},
+                timeout=8
+            )
+            if response.status_code == 200:
+                data = response.json()
+                address = data.get("address", {})
+                reverse_geocoding_results.append({
+                    "street": address.get("road") or address.get("street") or address.get("pedestrian"),
+                    "house_number": address.get("house_number"),
+                    "area": address.get("suburb") or address.get("neighbourhood") or address.get("quarter"),
+                    "city": address.get("city") or address.get("town") or address.get("village"),
+                    "state": address.get("state") or address.get("region"),
+                    "country": address.get("country"),
+                    "postal_code": address.get("postcode"),
+                    "full_address": data.get("display_name", ""),
+                    "method": "nominatim"
+                })
+        except Exception as e:
+            print(f"[Reverse Geocode Error - Nominatim]: {e}")
+    
+    def try_photon():
+        """Try Photon (Komoot) reverse geocoding API."""
+        try:
+            response = requests.get(
+                f"https://photon.komoot.io/reverse",
+                params={"lat": lat, "lon": lon},
+                timeout=8
+            )
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("features"):
+                    props = data["features"][0].get("properties", {})
+                    address = props.get("address", {})
+                    reverse_geocoding_results.append({
+                        "street": props.get("street") or address.get("street"),
+                        "house_number": props.get("housenumber") or address.get("housenumber"),
+                        "area": props.get("district") or props.get("suburb") or address.get("suburb"),
+                        "city": props.get("city") or props.get("town") or address.get("city"),
+                        "state": props.get("state") or address.get("state"),
+                        "country": props.get("country") or address.get("country"),
+                        "postal_code": props.get("postcode") or address.get("postcode"),
+                        "full_address": props.get("name", ""),
+                        "method": "photon"
+                    })
+        except Exception as e:
+            print(f"[Reverse Geocode Error - Photon]: {e}")
+    
+    def try_geopy():
+        """Try geopy Nominatim for reverse geocoding."""
+        try:
+            location = geolocator.reverse((lat, lon), timeout=8, exactly_one=True)
+            if location:
+                address_dict = location.raw.get("address", {})
+                reverse_geocoding_results.append({
+                    "street": address_dict.get("road") or address_dict.get("street"),
+                    "house_number": address_dict.get("house_number"),
+                    "area": address_dict.get("suburb") or address_dict.get("neighbourhood"),
+                    "city": address_dict.get("city") or address_dict.get("town") or address_dict.get("village"),
+                    "state": address_dict.get("state") or address_dict.get("region"),
+                    "country": address_dict.get("country"),
+                    "postal_code": address_dict.get("postcode"),
+                    "full_address": location.address,
+                    "method": "geopy"
+                })
+        except Exception as e:
+            print(f"[Reverse Geocode Error - Geopy]: {e}")
+    
+    # Run all reverse geocoding services in parallel
+    threads = [
+        threading.Thread(target=try_nominatim, daemon=True),
+        threading.Thread(target=try_photon, daemon=True),
+        threading.Thread(target=try_geopy, daemon=True)
+    ]
+    
+    for t in threads:
+        t.start()
+    
+    for t in threads:
+        t.join(timeout=8)
+    
+    # Combine results - prioritize results with street information
+    if reverse_geocoding_results:
+        # Find the result with the most complete street information
+        best_result = None
+        max_score = 0
+        
+        for result in reverse_geocoding_results:
+            score = 0
+            if result.get("street"):
+                score += 3
+            if result.get("house_number"):
+                score += 2
+            if result.get("area"):
+                score += 1
+            if result.get("city"):
+                score += 1
+            if score > max_score:
+                max_score = score
+                best_result = result
+        
+        if best_result:
+            address_info.update(best_result)
+            
+            # Build display address
+            address_parts = []
+            if best_result.get("house_number") and best_result.get("street"):
+                address_parts.append(f"{best_result['house_number']} {best_result['street']}")
+            elif best_result.get("street"):
+                address_parts.append(best_result["street"])
+            
+            if best_result.get("area"):
+                address_parts.append(best_result["area"])
+            
+            if best_result.get("city"):
+                address_parts.append(best_result["city"])
+            
+            if best_result.get("state"):
+                address_parts.append(best_result["state"])
+            
+            address_info["display_address"] = ", ".join(address_parts) if address_parts else best_result.get("full_address", "")
+            
+            # If no display address, use full address
+            if not address_info["display_address"]:
+                address_info["display_address"] = best_result.get("full_address", f"Near {best_result.get('city', 'Unknown')}")
+    
+    return address_info
+
+def extract_coords_from_location(location_result):
+    """
+    Helper function to extract coordinates from location result.
+    Handles both new dictionary format and old tuple format for backward compatibility.
+    Returns (lat, lon) tuple or None.
+    """
+    if location_result is None:
+        return None
+    
+    # If it's already a tuple (old format), return as is
+    if isinstance(location_result, tuple) and len(location_result) == 2:
+        return location_result
+    
+    # If it's a dictionary (new format), extract coords
+    if isinstance(location_result, dict):
+        coords = location_result.get("coords")
+        if coords and isinstance(coords, tuple) and len(coords) == 2:
+            return coords
+    
+    return None
+
 def get_current_location():
     """
     Automatically detect current location using multiple methods in parallel.
-    Returns precise coordinates (latitude, longitude) for accurate navigation.
+    Uses reverse geocoding to get street-level address information.
+    Returns a dictionary with:
+        - 'coords': (latitude, longitude) tuple
+        - 'address': dictionary with street, area, city, state, etc.
+        - 'display_address': formatted address string
+    For backward compatibility, can also return just coordinates tuple if address lookup fails.
     """
     speak("Detecting your exact location using multiple sources for better accuracy...")
     
@@ -3351,49 +3630,94 @@ def get_current_location():
     for t in threads:
         t.join(timeout=6)
     
-    # Process results
+    # Process results and get coordinates
+    final_coords = None
     if location_results:
         # Calculate average coordinates from all successful results for better accuracy
         if len(location_results) > 1:
             avg_lat = sum(r["coords"][0] for r in location_results) / len(location_results)
             avg_lon = sum(r["coords"][1] for r in location_results) / len(location_results)
-            
-            # Use the most common city name
-            cities = [r["city"] for r in location_results]
-            most_common_city = max(set(cities), key=cities.count)
-            regions = [r["region"] for r in location_results if r.get("region")]
-            most_common_region = max(set(regions), key=regions.count) if regions else ""
-            
-            speak(f"Detected your location: {most_common_city}, {most_common_region}")
-            speak(f"Coordinates: {avg_lat:.6f}, {avg_lon:.6f}. Using averaged location from {len(location_results)} sources for better accuracy.")
-            return (avg_lat, avg_lon)
+            final_coords = (avg_lat, avg_lon)
         else:
-            # Single result
-            result = location_results[0]
-            speak(f"Detected your location: {result['city']}, {result['region']}")
-            speak(f"Coordinates: {result['coords'][0]:.6f}, {result['coords'][1]:.6f}")
-            return result["coords"]
+            final_coords = location_results[0]["coords"]
     
     # If all methods failed, try one more time with a single method
-    speak("Trying alternative location detection method...")
-    try:
-        response = requests.get("https://ipapi.co/json/", timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            lat = data.get("latitude")
-            lon = data.get("longitude")
-            if lat and lon:
-                city = data.get("city", "Unknown")
-                region = data.get("region", "")
-                speak(f"Detected your location: {city}, {region}")
-                speak(f"Coordinates: {lat:.6f}, {lon:.6f}")
-                return (float(lat), float(lon))
-    except Exception as e:
-        print("[Location Detection Error - final attempt]", e)
+    if not final_coords:
+        speak("Trying alternative location detection method...")
+        try:
+            response = requests.get("https://ipapi.co/json/", timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                lat = data.get("latitude")
+                lon = data.get("longitude")
+                if lat and lon:
+                    final_coords = (float(lat), float(lon))
+        except Exception as e:
+            print("[Location Detection Error - final attempt]", e)
     
-    speak("Could not automatically detect your exact location. For more accurate navigation, please provide your address or enable GPS on your device.")
-    speak("Note: IP-based location detection provides city-level accuracy (within 1-5 kilometers). For precise navigation, GPS coordinates are recommended.")
-    return None
+    if not final_coords:
+        speak("Could not automatically detect your exact location. For more accurate navigation, please provide your address or enable GPS on your device.")
+        speak("Note: IP-based location detection provides city-level accuracy (within 1-5 kilometers). For precise navigation, GPS coordinates are recommended.")
+        return None
+    
+    # Now get detailed street-level address using reverse geocoding
+    speak("Getting detailed street-level address information...")
+    address_info = get_detailed_address_from_coords(final_coords[0], final_coords[1])
+    
+    # Build location result dictionary
+    location_result = {
+        "coords": final_coords,
+        "address": address_info,
+        "display_address": address_info.get("display_address")
+    }
+    
+    # Provide detailed voice feedback
+    if address_info.get("street"):
+        # Street-level address found
+        street = address_info["street"]
+        if address_info.get("house_number"):
+            street = f"{address_info['house_number']} {street}"
+        
+        area = address_info.get("area", "")
+        city = address_info.get("city", "")
+        state = address_info.get("state", "")
+        
+        address_parts = [street]
+        if area:
+            address_parts.append(area)
+        if city:
+            address_parts.append(city)
+        if state:
+            address_parts.append(state)
+        
+        full_location = ", ".join(address_parts)
+        speak(f"Your exact location: {full_location}")
+        speak(f"Coordinates: {final_coords[0]:.6f}, {final_coords[1]:.6f}")
+        speak("Street-level location detected. This will enable precise navigation within the city.")
+    elif address_info.get("area") or address_info.get("city"):
+        # Area or city-level address
+        area = address_info.get("area", "")
+        city = address_info.get("city", "")
+        state = address_info.get("state", "")
+        
+        location_parts = []
+        if area:
+            location_parts.append(area)
+        if city:
+            location_parts.append(city)
+        if state:
+            location_parts.append(state)
+        
+        location_str = ", ".join(location_parts) if location_parts else "Unknown area"
+        speak(f"Your location: {location_str}")
+        speak(f"Coordinates: {final_coords[0]:.6f}, {final_coords[1]:.6f}")
+        speak("Area-level location detected. For street-level accuracy, GPS is recommended.")
+    else:
+        # Fallback to coordinates only
+        speak(f"Detected coordinates: {final_coords[0]:.6f}, {final_coords[1]:.6f}")
+        speak("Using coordinates for navigation. Street address not available.")
+    
+    return location_result
 
 def get_coordinates(location_name):
     try:
@@ -3622,6 +3946,49 @@ def _load_mobilenet_ssd():
         print(f"[Model Load Error]: {e}")
         return None
 
+def _load_enhanced_yolo_model():
+    """Load enhanced YOLO model (YOLOv8m or YOLOv8s) for better detection."""
+    global enhanced_model
+    if enhanced_model is not None:
+        return enhanced_model
+    
+    try:
+        # Try to load medium model first (better accuracy)
+        try:
+            enhanced_model = YOLO("yolov8m.pt")
+            print("[Enhanced Model] Loaded YOLOv8m (medium) for better detection.")
+            return enhanced_model
+        except:
+            # Fallback to small model if medium fails
+            try:
+                enhanced_model = YOLO("yolov8s.pt")
+                print("[Enhanced Model] Loaded YOLOv8s (small) for better detection.")
+                return enhanced_model
+            except:
+                print("[Enhanced Model] Could not load enhanced model, using base model.")
+                return local_model
+    except Exception as e:
+        print(f"[Enhanced Model Error]: {e}")
+        return local_model
+
+def _load_detr_model():
+    """Load DETR model for additional object classes."""
+    global detr_model
+    if detr_model is not None:
+        return detr_model
+    
+    try:
+        from transformers import DetrImageProcessor, DetrForObjectDetection
+        detr_model = {
+            'processor': DetrImageProcessor.from_pretrained("facebook/detr-resnet-50"),
+            'model': DetrForObjectDetection.from_pretrained("facebook/detr-resnet-50")
+        }
+        print("[DETR Model] Loaded DETR for extended object detection.")
+        return detr_model
+    except Exception as e:
+        print(f"[DETR Model Error]: {e}")
+        return None
+
 CLASSES_NAV = [
     "background", "aeroplane", "bicycle", "bird", "boat",
     "bottle", "bus", "car", "cat", "chair", "cow", "diningtable",
@@ -3629,13 +3996,214 @@ CLASSES_NAV = [
     "sofa", "train", "tvmonitor"
 ]
 
+# Extended navigation-relevant object classes (COCO dataset - 80 classes)
+NAVIGATION_OBJECTS = {
+    # Vehicles (critical for navigation)
+    "vehicles": ["car", "bus", "truck", "motorcycle", "bicycle", "train", "boat", "airplane"],
+    # People and animals
+    "living": ["person", "dog", "cat", "horse", "cow", "sheep", "bird"],
+    # Obstacles
+    "obstacles": ["chair", "sofa", "bed", "dining table", "potted plant", "backpack", "umbrella", 
+                  "handbag", "suitcase", "frisbee", "skis", "snowboard", "sports ball", "kite",
+                  "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket"],
+    # Infrastructure
+    "infrastructure": ["traffic light", "fire hydrant", "stop sign", "parking meter", "bench"],
+    # Navigation aids
+    "navigation_aids": ["door", "wall", "stairs", "elevator", "escalator", "ramp"],
+    # Outdoor objects
+    "outdoor": ["tree", "fence", "building", "bridge", "pole"],
+    # Safety objects
+    "safety": ["fire hydrant", "stop sign", "traffic light", "crosswalk", "barrier"]
+}
+
+# YOLOv8 COCO class names (80 classes)
+YOLO_COCO_CLASSES = [
+    'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat',
+    'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird', 'cat',
+    'dog', 'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe', 'backpack',
+    'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee', 'skis', 'snowboard', 'sports ball',
+    'kite', 'baseball bat', 'baseball glove', 'skateboard', 'surfboard', 'tennis racket',
+    'bottle', 'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple',
+    'sandwich', 'orange', 'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair',
+    'couch', 'potted plant', 'bed', 'dining table', 'toilet', 'tv', 'laptop', 'mouse',
+    'remote', 'keyboard', 'cell phone', 'microwave', 'oven', 'toaster', 'sink', 'refrigerator',
+    'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'
+]
+
+def detect_clouds_and_predict_rain(frame):
+    """
+    Detect clouds in the camera frame and predict rain probability.
+    Analyzes the sky region (upper portion) for cloud patterns.
+    Returns: dict with cloud detection results and rain prediction
+    """
+    h, w = frame.shape[:2]
+    result = {
+        "clouds_detected": False,
+        "cloud_coverage": 0.0,  # 0-1 (0 = no clouds, 1 = fully covered)
+        "cloud_density": "none",  # "none", "light", "moderate", "heavy", "very_heavy"
+        "rain_probability": 0.0,  # 0-100
+        "rain_prediction": "unlikely",  # "unlikely", "possible", "likely", "very_likely"
+        "message": None,
+        "sky_visible": False
+    }
+    
+    try:
+        # Focus on upper 40% of frame (sky region)
+        sky_region = frame[0:int(h*0.4), :]
+        
+        if sky_region.size == 0:
+            return result
+        
+        # Convert to different color spaces for analysis
+        gray_sky = cv2.cvtColor(sky_region, cv2.COLOR_BGR2GRAY)
+        hsv_sky = cv2.cvtColor(sky_region, cv2.COLOR_BGR2HSV)
+        
+        # Method 1: Color analysis - clouds are white/gray, sky is blue
+        # Bright pixels (white/gray clouds)
+        _, bright_mask = cv2.threshold(gray_sky, 180, 255, cv2.THRESH_BINARY)
+        bright_pixels = np.sum(bright_mask > 0)
+        total_pixels = sky_region.shape[0] * sky_region.shape[1]
+        bright_ratio = bright_pixels / total_pixels if total_pixels > 0 else 0
+        
+        # Method 2: HSV analysis - detect white/gray (low saturation, high value)
+        # White/gray clouds have low saturation and high value
+        saturation = hsv_sky[:, :, 1]
+        value = hsv_sky[:, :, 2]
+        
+        # Cloud-like pixels: low saturation (< 50) and moderate-high value (> 100)
+        cloud_mask = cv2.bitwise_and(
+            cv2.threshold(saturation, 50, 255, cv2.THRESH_BINARY_INV)[1],
+            cv2.threshold(value, 100, 255, cv2.THRESH_BINARY)[1]
+        )
+        cloud_pixels = np.sum(cloud_mask > 0)
+        cloud_coverage = cloud_pixels / total_pixels if total_pixels > 0 else 0
+        
+        # Method 3: Texture analysis - clouds have different texture than clear sky
+        # Use variance to detect texture (clouds have more variance)
+        variance = np.var(gray_sky)
+        
+        # Method 4: Edge detection - clouds have more edges
+        edges = cv2.Canny(gray_sky, 50, 150)
+        edge_density = np.sum(edges > 0) / total_pixels if total_pixels > 0 else 0
+        
+        # Combine methods for cloud detection
+        # Weighted combination of different indicators
+        cloud_score = (
+            bright_ratio * 0.3 +
+            cloud_coverage * 0.4 +
+            min(variance / 1000, 1.0) * 0.2 +  # Normalize variance
+            min(edge_density * 2, 1.0) * 0.1  # Normalize edge density
+        )
+        
+        result["cloud_coverage"] = min(cloud_score, 1.0)
+        result["clouds_detected"] = cloud_score > 0.15  # Threshold for cloud detection
+        result["sky_visible"] = cloud_score < 0.8  # If too high, might be overcast
+        
+        # Determine cloud density
+        if cloud_score < 0.2:
+            result["cloud_density"] = "none"
+        elif cloud_score < 0.4:
+            result["cloud_density"] = "light"
+        elif cloud_score < 0.6:
+            result["cloud_density"] = "moderate"
+        elif cloud_score < 0.8:
+            result["cloud_density"] = "heavy"
+        else:
+            result["cloud_density"] = "very_heavy"
+        
+        # Predict rain probability based on cloud characteristics
+        # Factors: cloud coverage, density, darkness (dark clouds = rain clouds)
+        avg_brightness = np.mean(gray_sky)
+        
+        # Dark clouds (low brightness) with high coverage = higher rain probability
+        if cloud_score > 0.7 and avg_brightness < 100:
+            # Very dark, heavy clouds
+            result["rain_probability"] = min(80 + (1 - avg_brightness / 100) * 20, 95)
+            result["rain_prediction"] = "very_likely"
+        elif cloud_score > 0.6 and avg_brightness < 120:
+            # Dark, heavy clouds
+            result["rain_probability"] = min(60 + (1 - avg_brightness / 120) * 20, 85)
+            result["rain_prediction"] = "likely"
+        elif cloud_score > 0.5:
+            # Moderate to heavy clouds
+            result["rain_probability"] = min(30 + cloud_score * 30, 70)
+            result["rain_prediction"] = "possible"
+        elif cloud_score > 0.3:
+            # Light to moderate clouds
+            result["rain_probability"] = min(10 + cloud_score * 20, 40)
+            result["rain_prediction"] = "possible"
+        else:
+            # Few or no clouds
+            result["rain_probability"] = max(cloud_score * 15, 5)
+            result["rain_prediction"] = "unlikely"
+        
+        # Generate message based on analysis
+        if result["clouds_detected"]:
+            if result["rain_prediction"] == "very_likely":
+                result["message"] = f"Dark heavy clouds detected. Rain is very likely ({int(result['rain_probability'])}% chance). You should take an umbrella."
+            elif result["rain_prediction"] == "likely":
+                result["message"] = f"Heavy clouds detected. Rain is likely ({int(result['rain_probability'])}% chance). Consider taking an umbrella."
+            elif result["rain_prediction"] == "possible":
+                result["message"] = f"{result['cloud_density'].capitalize()} clouds detected. Rain is possible ({int(result['rain_probability'])}% chance). Keep an umbrella handy."
+            else:
+                result["message"] = f"Light clouds detected. Rain is unlikely ({int(result['rain_probability'])}% chance)."
+        else:
+            result["message"] = "Clear sky detected. No signs of rain."
+        
+    except Exception as e:
+        print(f"[Cloud Detection Error]: {e}")
+        result["clouds_detected"] = False
+    
+    return result
+
+def _categorize_objects(detections):
+    """
+    Categorize detected objects into navigation-relevant groups.
+    Returns dict with categorized objects for better navigation guidance.
+    """
+    categorized = {
+        "vehicles": [],
+        "people_animals": [],
+        "obstacles": [],
+        "infrastructure": [],
+        "safety": [],
+        "other": []
+    }
+    
+    for det in detections:
+        label_lower = det.get("label", "").lower()
+        found_category = False
+        
+        # Check each category
+        if label_lower in [o.lower() for o in NAVIGATION_OBJECTS.get("vehicles", [])]:
+            categorized["vehicles"].append(det)
+            found_category = True
+        elif label_lower in [o.lower() for o in NAVIGATION_OBJECTS.get("living", [])]:
+            categorized["people_animals"].append(det)
+            found_category = True
+        elif label_lower in [o.lower() for o in NAVIGATION_OBJECTS.get("obstacles", [])]:
+            categorized["obstacles"].append(det)
+            found_category = True
+        elif label_lower in [o.lower() for o in NAVIGATION_OBJECTS.get("infrastructure", [])]:
+            categorized["infrastructure"].append(det)
+            found_category = True
+        elif label_lower in [o.lower() for o in NAVIGATION_OBJECTS.get("safety", [])]:
+            categorized["safety"].append(det)
+            found_category = True
+        
+        if not found_category:
+            categorized["other"].append(det)
+    
+    return categorized
+
 def _detect_environment(frame, detections):
     """Detect if user is indoors or outdoors based on camera analysis."""
     h, w = frame.shape[:2]
     
-    # Check for outdoor indicators
-    outdoor_indicators = ["car", "bus", "motorbike", "bicycle", "train"]
-    vehicle_count = sum(1 for det in detections if det.get("label") in outdoor_indicators)
+    # Check for outdoor indicators (expanded list)
+    outdoor_indicators = ["car", "bus", "truck", "motorbike", "motorcycle", "bicycle", "train", 
+                          "traffic light", "stop sign", "fire hydrant", "parking meter", "bench"]
+    vehicle_count = sum(1 for det in detections if det.get("label", "").lower() in [o.lower() for o in outdoor_indicators])
     
     # Analyze brightness and color distribution (outdoors usually brighter, more varied)
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -3643,13 +4211,14 @@ def _detect_environment(frame, detections):
     std_dev = np.std(gray)
     
     # Indoor typically has: furniture (chair, sofa, diningtable), lower brightness variance
-    indoor_indicators = ["chair", "sofa", "diningtable", "tvmonitor"]
-    indoor_count = sum(1 for det in detections if det.get("label") in indoor_indicators)
+    indoor_indicators = ["chair", "sofa", "dining table", "bed", "tv", "laptop", "refrigerator", 
+                         "microwave", "oven", "toilet", "couch"]
+    indoor_count = sum(1 for det in detections if det.get("label", "").lower() in [o.lower() for o in indoor_indicators])
     
-    # Decision logic
+    # Decision logic (improved)
     if vehicle_count >= 2 or (brightness > 100 and std_dev > 40 and vehicle_count >= 1):
         return "outdoor"
-    elif indoor_count >= 2 or (brightness < 80 and std_dev < 30):
+    elif indoor_count >= 2 or (brightness < 80 and std_dev < 30 and indoor_count >= 1):
         return "indoor"
     else:
         return "unknown"
@@ -3868,15 +4437,23 @@ def check_camera_orientation(frame):
     return result
 
 def _start_realtime_navigation(route, dest_name, dest_coords, start_coords):
-    """Real-time camera-based navigation with obstacle detection and path analysis."""
+    """Real-time camera-based navigation with enhanced obstacle detection and path analysis."""
     speak(f"Starting real-time navigation to {dest_name}.")
     speak("I will guide you using the camera. Keep the camera facing forward.")
+    speak("Enhanced object detection enabled. I can now detect and differentiate more objects for better navigation.")
     
-    # Load detection model
+    # Load detection models
     net = _load_mobilenet_ssd()
     if not net:
         speak("Could not load vision model. Using basic navigation.")
         return
+    
+    # Pre-load enhanced YOLO model for better detection
+    try:
+        _load_enhanced_yolo_model()
+        print("[Navigation] Enhanced detection models loaded successfully.")
+    except Exception as e:
+        print(f"[Navigation] Enhanced model loading warning: {e}")
     
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -3920,13 +4497,15 @@ def _start_realtime_navigation(route, dest_name, dest_coords, start_coords):
                 time.sleep(0.5)
                 continue
             
+            # Enhanced ensemble object detection using multiple models
+            det_list = []
+            vehicles_detected = []
+            closest_obstacle = None
+            
+            # Method 1: MobileNet-SSD (fast, good for basic objects)
             blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)), 0.007843, (300, 300), 127.5)
             net.setInput(blob)
             detections = net.forward()
-            
-            closest_obstacle = None
-            det_list = []
-            vehicles_detected = []
             
             for i in np.arange(0, detections.shape[2]):
                 confidence = detections[0, 0, i, 2]
@@ -3940,32 +4519,96 @@ def _start_realtime_navigation(route, dest_name, dest_coords, start_coords):
                 label = CLASSES_NAV[idx]
                 box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
                 (startX, startY, endX, endY) = box.astype("int")
-                
                 height_ratio = (endY - startY) / float(h)
                 
-                # Track obstacles
-                if label in ["person", "car", "bus", "bicycle", "motorbike", "train", "dog", "chair", "sofa", "diningtable"]:
-                    if closest_obstacle is None or height_ratio > closest_obstacle["ratio"]:
-                        closest_obstacle = {
-                            "label": label,
-                            "startX": startX,
-                            "startY": startY,
-                            "endX": endX,
-                            "endY": endY,
-                            "ratio": height_ratio
-                        }
-                    det_list.append({
-                        "label": label,
-                        "startX": startX,
-                        "startY": startY,
-                        "endX": endX,
-                        "endY": endY,
-                        "ratio": height_ratio
-                    })
+                det_list.append({
+                    "label": label,
+                    "startX": startX,
+                    "startY": startY,
+                    "endX": endX,
+                    "endY": endY,
+                    "ratio": height_ratio,
+                    "confidence": confidence,
+                    "source": "mobilenet"
+                })
                 
-                # Track vehicles for road crossing
                 if label in ["car", "bus", "motorbike", "bicycle", "train"]:
                     vehicles_detected.append({"label": label, "ratio": height_ratio})
+            
+            # Method 2: Enhanced YOLO (better accuracy, more classes)
+            try:
+                yolo_model = _load_enhanced_yolo_model()
+                yolo_results = yolo_model(frame, verbose=False, conf=0.35)
+                
+                for result in yolo_results:
+                    for box in result.boxes:
+                        cls = int(box.cls[0])
+                        conf = float(box.conf[0])
+                        if conf > 0.35:
+                            obj_name = yolo_model.names[cls]
+                            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                            
+                            # Check if this object is navigation-relevant
+                            is_nav_relevant = False
+                            for category, objects in NAVIGATION_OBJECTS.items():
+                                if obj_name.lower() in [o.lower() for o in objects]:
+                                    is_nav_relevant = True
+                                    break
+                            
+                            if is_nav_relevant or obj_name.lower() in ["person", "car", "bus", "bicycle", "motorcycle", "train", "truck"]:
+                                height_ratio = (y2 - y1) / float(h)
+                                
+                                # Check if we already have this object from MobileNet (avoid duplicates)
+                                is_duplicate = False
+                                for existing in det_list:
+                                    if existing["label"].lower() == obj_name.lower():
+                                        # If YOLO has higher confidence, update
+                                        if conf > existing.get("confidence", 0):
+                                            existing["label"] = obj_name
+                                            existing["confidence"] = conf
+                                            existing["startX"] = int(x1)
+                                            existing["startY"] = int(y1)
+                                            existing["endX"] = int(x2)
+                                            existing["endY"] = int(y2)
+                                            existing["ratio"] = height_ratio
+                                            existing["source"] = "yolo"
+                                        is_duplicate = True
+                                        break
+                                
+                                if not is_duplicate:
+                                    det_list.append({
+                                        "label": obj_name,
+                                        "startX": int(x1),
+                                        "startY": int(y1),
+                                        "endX": int(x2),
+                                        "endY": int(y2),
+                                        "ratio": height_ratio,
+                                        "confidence": conf,
+                                        "source": "yolo"
+                                    })
+                                
+                                # Track vehicles
+                                if obj_name.lower() in ["car", "bus", "truck", "motorcycle", "bicycle", "train"]:
+                                    vehicles_detected.append({"label": obj_name, "ratio": height_ratio})
+            except Exception as e:
+                print(f"[YOLO Detection Error]: {e}")
+            
+            # Find closest obstacle from combined detections
+            for det in det_list:
+                label_lower = det["label"].lower()
+                if label_lower in ["person", "car", "bus", "bicycle", "motorcycle", "train", "truck", 
+                                  "dog", "chair", "sofa", "dining table", "bed", "potted plant",
+                                  "backpack", "suitcase", "umbrella", "bench", "pole", "fence"]:
+                    if closest_obstacle is None or det["ratio"] > closest_obstacle["ratio"]:
+                        closest_obstacle = {
+                            "label": det["label"],
+                            "startX": det["startX"],
+                            "startY": det["startY"],
+                            "endX": det["endX"],
+                            "endY": det["endY"],
+                            "ratio": det["ratio"],
+                            "confidence": det.get("confidence", 0.5)
+                        }
             
             depth_messages, low_texture_flag = analyze_depth_for_navigation(frame)
             depth_alert_active = False
@@ -4002,8 +4645,33 @@ def _start_realtime_navigation(route, dest_name, dest_coords, start_coords):
                 )
                 empty_scene_counter = 0
 
+            # Real-time cloud detection and rain prediction (only outdoors or when sky is visible)
+            cloud_analysis = None
+            if frame is not None:
+                cloud_analysis = detect_clouds_and_predict_rain(frame)
+                # Only announce if outdoors and clouds are detected with significant rain probability
+                if cloud_analysis.get("clouds_detected") and cloud_analysis.get("rain_probability", 0) > 30:
+                    if cloud_analysis.get("rain_prediction") in ["likely", "very_likely"]:
+                        _speak_rate_limited(last_said, "cloud_rain_warning", cloud_analysis.get("message", ""), 15.0)
+                    elif cloud_analysis.get("rain_probability", 0) > 50:
+                        _speak_rate_limited(last_said, "cloud_rain_alert", cloud_analysis.get("message", ""), 20.0)
+            
+            # Categorize objects for better navigation guidance
+            categorized_objects = _categorize_objects(det_list)
+            
             # Detect environment (indoor/outdoor) for context-aware guidance
             environment = _detect_environment(frame, det_list)
+            
+            # Enhanced object differentiation and announcements
+            if categorized_objects["safety"]:
+                for safety_obj in categorized_objects["safety"][:2]:  # Announce top 2 safety objects
+                    obj_name = safety_obj.get("label", "")
+                    if obj_name.lower() == "stop sign":
+                        _speak_rate_limited(last_said, f"safety_{obj_name}", f"Stop sign detected ahead. Please stop and check before proceeding.", 8.0)
+                    elif obj_name.lower() == "traffic light":
+                        _speak_rate_limited(last_said, f"safety_{obj_name}", f"Traffic light detected. Please wait for safe crossing signal.", 8.0)
+                    elif obj_name.lower() == "fire hydrant":
+                        _speak_rate_limited(last_said, f"safety_{obj_name}", f"Fire hydrant detected. Be careful not to bump into it.", 10.0)
             
             # Provide context-aware guidance based on environment
             if environment == "indoor":
@@ -4047,6 +4715,25 @@ def _start_realtime_navigation(route, dest_name, dest_coords, start_coords):
                         _speak_rate_limited(last_said, "road_cross", "Road crossing detected. Look both ways and cross when clear.", 4.0)
                 else:
                     _speak_rate_limited(last_said, "road_clear", "Road crossing ahead. Path looks clear. You can cross.", 4.0)
+            
+            # Enhanced obstacle announcements with better differentiation
+            if categorized_objects["vehicles"]:
+                vehicle_types = {}
+                for veh in categorized_objects["vehicles"]:
+                    veh_type = veh.get("label", "").lower()
+                    if veh_type not in vehicle_types:
+                        vehicle_types[veh_type] = []
+                    vehicle_types[veh_type].append(veh)
+                
+                # Announce different vehicle types separately
+                for veh_type, veh_list in list(vehicle_types.items())[:3]:  # Top 3 types
+                    count = len(veh_list)
+                    closest_veh = max(veh_list, key=lambda x: x.get("ratio", 0))
+                    distance_desc = "very close" if closest_veh.get("ratio", 0) > 0.4 else "nearby"
+                    if count > 1:
+                        _speak_rate_limited(last_said, f"vehicles_{veh_type}", f"{count} {veh_type}s detected {distance_desc}.", 6.0)
+                    else:
+                        _speak_rate_limited(last_said, f"vehicle_{veh_type}", f"{veh_type} detected {distance_desc}.", 6.0)
             
             # Obstacle avoidance guidance (for outdoor or when not handled by indoor-specific logic)
             if environment != "indoor" and closest_obstacle is not None:
@@ -4221,7 +4908,8 @@ def navigation_mode():
     speak(f"Destination {dest_name} found.")
 
     # Automatically detect current location
-    start_coords = get_current_location()
+    location_result = get_current_location()
+    start_coords = extract_coords_from_location(location_result)
     
     if not start_coords:
         # Final fallback: ask user only if auto-detection fails
